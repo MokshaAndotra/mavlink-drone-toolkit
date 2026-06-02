@@ -1,69 +1,64 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Thu May 15 18:29:23 2025
+Created on Thu May 15 19:44:29 2025
 
 @author: moksha
 """
 
 from pymavlink import mavutil
-import time
-import cv2
 import threading
+import cv2
+import time
 
-camera_active = False
+camera_running = False
 
-def connect_vehicle(connection_string):
-    """
-    Connect to the vehicle.
-    """
-    print("Connecting to vehicle...")
-    the_connection = mavutil.mavlink_connection(connection_string)
-    the_connection.wait_heartbeat()
-    print("Heartbeat received!")
-    return the_connection
+def connect_to_drone(conn_str):
+    print("Connecting to drone...")
+    conn = mavutil.mavlink_connection(conn_str)
+    conn.wait_heartbeat()
+    print("Heartbeat received.")
+    return conn
 
-def start_camera():
-    """Non-blocking camera operation in a thread."""
-    global camera_active
-    print("Starting the camera...")
+def camera_stream(device_index=0, resolution=(640, 480)):
+    global camera_running
+    cap = cv2.VideoCapture(device_index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
 
-    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("Error: Cannot open the camera.")
+        print("Failed to open camera.")
         return
 
-    while camera_active:
+    print("Camera streaming started.")
+    while camera_running:
         ret, frame = cap.read()
         if not ret:
-            print("Failed to grab frame")
+            print("Frame read failed.")
             break
-        cv2.imshow('Camera Feed', frame)
-
+        cv2.imshow('Live Feed', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     cap.release()
     cv2.destroyAllWindows()
-    print("Camera stopped.")
+    print("Camera streaming stopped.")
 
-def parse_waypoint_file(file_path):
-    """
-    Parse a waypoint file in Mission Planner format.
-    """
-    with open(file_path, 'r') as file:
-        lines = file.readlines()
-    
+def load_waypoints(file_path):
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+
     if not lines[0].startswith("QGC WPL"):
-        raise ValueError("Invalid waypoint file format")
-    
+        raise ValueError("Invalid waypoint file format.")
+
     waypoints = []
     for line in lines[1:]:
         parts = line.strip().split('\t')
-        seq, current, frame, command = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-        param1, param2, param3, param4 = float(parts[4]), float(parts[5]), float(parts[6]), float(parts[7])
-        lat, lon, alt, autocontinue = float(parts[8]), float(parts[9]), float(parts[10]), int(parts[11])
-        
+        seq, current, frame, command = map(int, parts[:4])
+        param1, param2, param3, param4 = map(float, parts[4:8])
+        lat, lon, alt = map(float, parts[8:11])
+        autocontinue = int(parts[11])
+
         waypoint = mavutil.mavlink.MAVLink_mission_item_message(
             target_system=1,
             target_component=1,
@@ -72,102 +67,123 @@ def parse_waypoint_file(file_path):
             command=command,
             current=current,
             autocontinue=autocontinue,
-            param1=param1, param2=param2, param3=param3, param4=param4,
+            param1=param1, param2=param2,
+            param3=param3, param4=param4,
             x=lat, y=lon, z=alt
         )
         waypoints.append(waypoint)
-    
+
     return waypoints
 
-def upload_mission(the_connection, waypoints):
-    """
-    Upload waypoints to the vehicle.
-    """
+def send_mission(conn, waypoints):
     print("Uploading mission...")
-    the_connection.mav.mission_count_send(the_connection.target_system, the_connection.target_component, len(waypoints))
-    for waypoint in waypoints:
-        the_connection.mav.mission_request_int_send(the_connection.target_system, the_connection.target_component, waypoint.seq)
-        print(f"Requesting waypoint {waypoint.seq}")
-        the_connection.mav.mission_item_int_send(
-            the_connection.target_system,
-            the_connection.target_component,
-            waypoint.seq,
-            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-            waypoint.command,
-            waypoint.current,
-            waypoint.autocontinue,
-            waypoint.param1, waypoint.param2, waypoint.param3, waypoint.param4,
-            int(waypoint.x * 1e7),
-            int(waypoint.y * 1e7),
-            waypoint.z
-        )
-    print("Mission upload complete!")
+    conn.mav.mission_count_send(conn.target_system, conn.target_component, len(waypoints))
 
-def start_mission(the_connection):
-    """
-    Arm the vehicle and start the mission.
-    """
-    the_connection.set_mode('GUIDED')
-    print("Arming the vehicle...")
-    the_connection.mav.command_long_send(
-        the_connection.target_system,
-        the_connection.target_component,
+    for wp in waypoints:
+        while True:
+            req = conn.recv_match(type='MISSION_REQUEST', blocking=True, timeout=3)
+            if req and req.seq == wp.seq:
+                conn.mav.mission_item_send(
+                    conn.target_system,
+                    conn.target_component,
+                    wp.seq,
+                    wp.frame,
+                    wp.command,
+                    wp.current,
+                    wp.autocontinue,
+                    wp.param1, wp.param2, wp.param3, wp.param4,
+                    wp.x, wp.y, wp.z
+                )
+                print(f"Sent waypoint {wp.seq}")
+                break
+
+    print("Mission upload complete.")
+
+def arm_drone(conn, timeout=10):
+    print("Arming drone...")
+    conn.set_mode('GUIDED')
+    conn.mav.command_long_send(
+        conn.target_system,
+        conn.target_component,
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
         0, 1, 0, 0, 0, 0, 0, 0
     )
-    while True:
-        msg = the_connection.recv_match(type='HEARTBEAT', blocking=True)
-        if msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
-            print("Vehicle armed!")
-            break
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        msg = conn.recv_match(type='HEARTBEAT', blocking=True)
+        if msg and msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED:
+            print("Drone armed.")
+            return True
         print("Waiting for arming...")
         time.sleep(1)
-    
-    print("Setting mode to AUTO...")
-    the_connection.set_mode('AUTO')
+
+    print("Failed to arm drone.")
+    return False
+
+def initiate_mission(conn):
+    print("Switching to AUTO mode and starting mission...")
+    conn.set_mode('AUTO')
     time.sleep(2)
-    print("Starting mission...")
-    the_connection.mav.command_long_send(
-        the_connection.target_system,
-        the_connection.target_component,
+    conn.mav.command_long_send(
+        conn.target_system,
+        conn.target_component,
         mavutil.mavlink.MAV_CMD_MISSION_START,
         0, 0, 0, 0, 0, 0, 0, 0
     )
+    print("Mission started.")
 
-def monitor_waypoints(the_connection):
-    """
-    Monitor waypoints and trigger camera actions.
-    """
-    global camera_active
+def wait_for_landing(conn):
+    print("Waiting for drone to land and disarm...")
+    while True:
+        msg = conn.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
+        if msg and not (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+            print("Drone disarmed. Mission complete.")
+            break
+        time.sleep(1)
+
+def monitor_mission(conn, trigger_on=5, stop_on=10, final_wp=17):
+    global camera_running
+    print("Monitoring mission progress...")
     try:
         while True:
-            msg = the_connection.recv_match(blocking=True)
+            msg = conn.recv_match(type='MISSION_ITEM_REACHED', blocking=True)
             if msg:
-                print(f"[{msg.get_type()}] {msg}")
-            msg_wp = the_connection.recv_match(type='MISSION_ITEM_REACHED', blocking=True)
-            if msg_wp:
-                reached_wp = msg_wp.seq
-                print(f"Reached Waypoint Index: {reached_wp}")
-                if reached_wp == 16 and not camera_active:
-                    camera_active = True
-                    threading.Thread(target=start_camera).start()
-                if reached_wp == 21 and camera_active:
-                    print("Stopping camera at waypoint 21...")
-                    camera_active = False
+                wp_index = msg.seq
+                print(f"Reached waypoint: {wp_index}")
+
+                if wp_index == trigger_on and not camera_running:
+                    print("Starting camera...")
+                    camera_running = True
+                    threading.Thread(target=camera_stream).start()
+
+                if wp_index == stop_on and camera_running:
+                    print("Stopping camera...")
+                    camera_running = False
+
+                if wp_index == final_wp:
+                    print("Final waypoint reached. Ending monitoring.")
                     break
     except KeyboardInterrupt:
-        print("Monitoring stopped.")
-        camera_active = False
+        print("Monitoring interrupted by user.")
+        camera_running = False
 
 def main():
-    connection_string = "udp:127.0.0.1:14550"
-    waypoint_file_path = "/home/moksha/Downloads/ai_lap_modified.waypoints"
-    
-    the_connection = connect_vehicle(connection_string)
-    waypoints = parse_waypoint_file(waypoint_file_path)
-    upload_mission(the_connection, waypoints)
-    start_mission(the_connection)
-    monitor_waypoints(the_connection)
+    conn_str = "udp:127.0.0.1:14550"
+    wp_file = "/home/moksha/Downloads/ai_lap_modified.waypoints"
+
+    conn = connect_to_drone(conn_str)
+    waypoints = load_waypoints(wp_file)
+    send_mission(conn, waypoints)
+
+    final_waypoint_seq = waypoints[-1].seq  # Get last waypoint number
+
+    if arm_drone(conn):
+        initiate_mission(conn)
+        monitor_mission(conn, trigger_on=5, stop_on=10, final_wp=final_waypoint_seq)
+        wait_for_landing(conn)
+    else:
+        print("Aborting mission due to arming failure.")
 
 if __name__ == "__main__":
     main()
